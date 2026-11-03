@@ -1,0 +1,109 @@
+name: Build Pushgateway TTL
+
+run-name: Build ${{ inputs.tag }} for Linux amd64 and arm64
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '源码 tag（例如 v1.4.0）'
+        required: true
+        default: 'v1.4.0'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: linux-${{ matrix.arch }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout selected source tag
+        uses: actions/checkout@v7
+        with:
+          repository: zhoulijun89/prometheus-pushgateway-with-ttl
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+
+      # Match the Go 1.15 toolchain specified in the source .promu.yml.
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.15.15'
+          cache: false
+
+      - name: Build and package
+        id: package
+        env:
+          SOURCE_TAG: ${{ inputs.tag }}
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: '0'
+          GO111MODULE: 'on'
+        run: |
+          set -euo pipefail
+
+          # Git tag names can contain slashes; keep artifact names portable.
+          safe_tag="$(printf '%s' "$SOURCE_TAG" | sed 's/[^a-zA-Z0-9._-]/_/g')"
+          package="pushgateway-${safe_tag}.${GOOS}-${GOARCH}"
+          revision="$(git rev-parse HEAD)"
+          build_date="$(date -u +%Y%m%d-%H:%M:%S)"
+          mkdir -p "dist/$package"
+
+          # v1.4.0 includes vendored dependencies and generated web assets.
+          if [[ -f go.mod && -d vendor ]]; then
+            module_mode=vendor
+          elif [[ -f go.mod ]]; then
+            module_mode=readonly
+          else
+            echo '::error::This tag has no go.mod. Select a Go Modules tag, such as v1.4.0.'
+            exit 1
+          fi
+
+          # Use VERSION for linker metadata: user-supplied tags may contain spaces.
+          version="$(tr -d '\r\n' < VERSION)"
+          ldflags="-s -w"
+          ldflags+=" -X github.com/prometheus/common/version.Version=$version"
+          ldflags+=" -X github.com/prometheus/common/version.Revision=$revision"
+          ldflags+=" -X github.com/prometheus/common/version.BuildUser=github-actions"
+          ldflags+=" -X github.com/prometheus/common/version.BuildDate=$build_date"
+
+          go build -mod="$module_mode" -trimpath -tags netgo \
+            -ldflags "$ldflags" -o "dist/$package/pushgateway" .
+          file "dist/$package/pushgateway"
+
+          for doc in LICENSE NOTICE README.md; do
+            if [[ -f "$doc" ]]; then
+              cp "$doc" "dist/$package/"
+            fi
+          done
+          printf 'repository=%s\ntag=%s\ncommit=%s\nplatform=%s/%s\n' \
+            'zhoulijun89/prometheus-pushgateway-with-ttl' \
+            "$SOURCE_TAG" "$revision" "$GOOS" "$GOARCH" \
+            > "dist/$package/BUILD-INFO.txt"
+
+          tar -C dist -czf "dist/$package.tar.gz" "$package"
+          (cd dist && sha256sum "$package.tar.gz" > "$package.tar.gz.sha256")
+          echo "name=$package" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
